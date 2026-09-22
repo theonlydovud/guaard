@@ -1,100 +1,64 @@
 const { Bot, webhookCallback } = require("grammy");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // Твой Telegram ID для заявок
-
-if (!BOT_TOKEN) {
-  throw new Error("BOT_TOKEN is missing in environment variables!");
-}
-
 const bot = new Bot(BOT_TOKEN);
 
-// Кэш для хранения временных отметок сообщений и замученных юзеров
-const messageHistory = new Map();
+// Временный кэш в рамках одного инстанса Vercel
 const mutedUsers = new Set();
+const messageHistory = new Map();
 
-// -------------------------------------------------------------
-// 1. КОМАНДА /start И ФОРМА ЗАЯВКИ
-// -------------------------------------------------------------
-bot.command("start", async (ctx) => {
-  await ctx.reply(
-    "👋 Привет! Это бот-защитник для личных сообщений в Telegram Business.\n\n" +
-      "🛡 **Что он делает?**\n" +
-      "Если собеседник отправляет вам больше 5 сообщений за 20 секунд, бот моментально начинает удалять все его последующие сообщения (авто-мут без лишних кликов).\n\n" +
-      "💳 **Подключение:** 15 000 сум / месяц.\n\n" +
-      "Нажмите кнопку ниже, чтобы подать заявку на подключение:",
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "📝 Подать заявку", callback_data: "apply" }]
-        ]
-      }
-    }
-  );
-});
-
-// Обработка кнопки "Подать заявку"
-bot.callbackQuery("apply", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  
-  const user = ctx.from;
-  const username = user.username ? `@${user.username}` : "отсутствует";
-  
-  // Уведомление администратору (тебе)
-  if (ADMIN_CHAT_ID) {
-    await ctx.api.sendMessage(
-      ADMIN_CHAT_ID,
-      `🚀 **Новая заявка на подписку!**\n\n` +
-        `👤 **Имя:** \({user.first_name}\){user.last_name || ""}\n` +
-        `🔗 **Username:** ${username}\n` +
-        `🆔 **ID:** \`${user.id}\``,
-      { parse_mode: "Markdown" }
-    );
-  }
-
-  await ctx.reply("✅ Ваша заявка принята! Заявка передана администратору, скоро с вами свяжутся для активации.");
-});
-
-// -------------------------------------------------------------
-// 2. АВТО-МУТ СПАМЕРОВ В TELEGRAM BUSINESS
-// -------------------------------------------------------------
 bot.on("business_message", async (ctx) => {
   const msg = ctx.update.business_message;
   const connId = msg.business_connection_id;
   const senderId = msg.from.id;
-  const now = Date.now();
+  const text = msg.text || "";
 
-  // Игнорируем свои собственные сообщения
-  if (senderId === ctx.me.id) return;
-
-  // Если отправитель уже в авто-муте — удаляем сообщение
-  if (mutedUsers.has(senderId)) {
-    try {
+  // 1. РУЧНОЙ МУТИ / АНМУТ (когда ты пишешь .mute или .unmute в ответ на сообщение)
+  if (senderId === ctx.me.id) {
+    if (text.startsWith(".mute") && msg.reply_to_message) {
+      const targetId = msg.reply_to_message.from.id;
+      mutedUsers.add(targetId);
+      
+      // Удаляем твою команду .mute из чата
       await ctx.api.deleteBusinessMessage(connId, msg.chat.id, msg.message_id);
-    } catch (e) {
-      console.error("Ошибка удаления сообщения замученного пользователя:", e);
+      return;
+    }
+
+    if (text.startsWith(".unmute") && msg.reply_to_message) {
+      const targetId = msg.reply_to_message.from.id;
+      mutedUsers.delete(targetId);
+      
+      await ctx.api.deleteBusinessMessage(connId, msg.chat.id, msg.message_id);
+      return;
     }
     return;
   }
 
-  // Считаем количество сообщений от этого пользователя за последние 20 секунд
+  // 2. ЕСЛИ ЮЗЕР УЖЕ В МУТЕ — МОМЕНТАЛЬНО УДАЛЯЕМ
+  if (mutedUsers.has(senderId)) {
+    try {
+      await ctx.api.deleteBusinessMessage(connId, msg.chat.id, msg.message_id);
+    } catch (e) {
+      console.error("Ошибка удаления:", e);
+    }
+    return;
+  }
+
+  // 3. АВТО-МУТ ЗА СПАМ (>5 сообщений за 20 секунд)
+  const now = Date.now();
   let timestamps = messageHistory.get(senderId) || [];
-  timestamps = timestamps.filter((t) => now - t <= 20000); // 20000 мс = 20 секунд
+  timestamps = timestamps.filter((t) => now - t <= 20000); // Сообщения за последние 20 сек
   timestamps.push(now);
   messageHistory.set(senderId, timestamps);
 
-  // ПРОВЕРКА: Если отправлено больше 5 сообщений за 20 секунд
   if (timestamps.length > 5) {
-    mutedUsers.add(senderId); // Отправляем в мут
-
+    mutedUsers.add(senderId); // Кидаем в мут
     try {
-      // Удаляем сообщение, которое превысило лимит (6-е)
       await ctx.api.deleteBusinessMessage(connId, msg.chat.id, msg.message_id);
     } catch (e) {
-      console.error("Ошибка при авто-муте:", e);
+      console.error("Ошибка авто-мута:", e);
     }
   }
 });
 
-// Экспорт вебхука для Vercel Serverless
 module.exports = webhookCallback(bot, "http");
