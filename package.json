@@ -1,8 +1,13 @@
 {
-  "name": "tg-business-antispam",
+  "name": "telegram-antispam-business-bot",
   "version": "1.0.0",
+  "private": true,
+  "description": "Telegram Business anti-spam bot",
   "main": "api/webhook.js",
-  "dependencies": {
-    "grammy": "^1.30.0"
+  "scripts": {
+    "start": "vercel dev"
+  },
+  "engines": {
+    "node": "20.x"
   }
 }
