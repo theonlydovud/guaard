@@ -1,108 +1,279 @@
-const { Bot, webhookCallback } = require("grammy");
-
 const BOT_TOKEN = process.env.BOT_TOKEN;
+
 if (!BOT_TOKEN) {
-  throw new Error("BOT_TOKEN is missing!");
+  throw new Error("BOT_TOKEN is not configured");
 }
 
-const bot = new Bot(BOT_TOKEN);
+const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-// Глобальные переменные в рамках горячего контейнера Vercel
-if (!global.mutedChats) global.mutedChats = new Set();
-if (!global.messageHistory) global.messageHistory = new Map();
+// MVP storage.
+// Важно: Vercel serverless не гарантирует постоянную память.
+// Для первого теста этого достаточно.
+const mutedChats = globalThis.mutedChats || new Set();
+globalThis.mutedChats = mutedChats;
 
-// --------------------------------------------------------
-// 1. КОМАНДА /start В ЛС БОТА
-// --------------------------------------------------------
-bot.command("start", async (ctx) => {
-  await ctx.reply(
-    "🛡 **Guaard Bot запущен!**\n\n" +
-      "Я работаю в режиме Telegram Business.\n\n" +
-      "📌 **Как использовать в чатах:**\n" +
-      "• Напиши `.mute` в любом чате — входящие сообщения собеседника будут моментально удаляться.\n" +
-      "• Напиши `.unmute` — чтобы снять мут.\n" +
-      "• Если собеседник пришлёт больше 5 сообщений за 20 секунд — он автоматически уйдёт в мут."
-  );
-});
+const connections = globalThis.connections || new Map();
+globalThis.connections = connections;
 
-// --------------------------------------------------------
-// 2. TELEGRAM BUSINESS MESSAGES (Личные чаты)
-// --------------------------------------------------------
-bot.on("business_message", async (ctx) => {
-  const msg = ctx.update.business_message;
-  const connId = msg.business_connection_id; // Важно для Business API
-  const chatId = msg.chat.id;
-  const senderId = msg.from.id;
-  const text = (msg.text || "").trim();
+async function telegram(method, body) {
+  const response = await fetch(`${API}/${method}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
 
-  // --------------------------------------------------------
-  // А) Ты пишешь команды управления (.mute / .unmute)
-  // --------------------------------------------------------
-  if (senderId === ctx.me.id) {
-    if (text === ".mute") {
-      global.mutedChats.add(chatId);
+  const data = await response.json();
 
-      // Удаляем само сообщение .mute
-      try {
-        await ctx.api.deleteMessage(chatId, msg.message_id, {
-          business_connection_id: connId,
+  if (!data.ok) {
+    console.error(`Telegram API error (${method}):`, data);
+  }
+
+  return data;
+}
+
+async function sendMessage(chatId, text, businessConnectionId = null) {
+  const body = {
+    chat_id: chatId,
+    text,
+  };
+
+  if (businessConnectionId) {
+    body.business_connection_id = businessConnectionId;
+  }
+
+  return telegram("sendMessage", body);
+}
+
+async function deleteBusinessMessage(
+  businessConnectionId,
+  chatId,
+  messageId
+) {
+  return telegram("deleteBusinessMessages", {
+    business_connection_id: businessConnectionId,
+    chat_id: chatId,
+    message_ids: [messageId],
+  });
+}
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(200).json({
+      ok: true,
+      message: "Anti-Spam Business Bot is running.",
+    });
+  }
+
+  try {
+    const update = req.body;
+
+    console.log("Telegram update:", JSON.stringify(update));
+
+    // =========================================================
+    // 1. BUSINESS CONNECTION
+    // =========================================================
+
+    if (update.business_connection) {
+      const connection = update.business_connection;
+
+      if (connection.is_enabled) {
+        connections.set(connection.id, {
+          userId: connection.user.id,
+          rights: connection.rights || {},
         });
-      } catch (e) {
-        console.error("Ошибка удаления .mute:", e);
+
+        console.log(
+          `Business connection enabled: ${connection.id}`
+        );
+      } else {
+        connections.delete(connection.id);
+
+        console.log(
+          `Business connection disabled: ${connection.id}`
+        );
       }
-      return;
+
+      return res.status(200).json({ ok: true });
     }
 
-    if (text === ".unmute") {
-      global.mutedChats.delete(chatId);
+    // =========================================================
+    // 2. NORMAL /START
+    // =========================================================
 
-      try {
-        await ctx.api.deleteMessage(chatId, msg.message_id, {
-          business_connection_id: connId,
-        });
-      } catch (e) {
-        console.error("Ошибка удаления .unmute:", e);
+    if (update.message) {
+      const message = update.message;
+
+      if (
+        message.text &&
+        message.text.trim().toLowerCase().startsWith("/start")
+      ) {
+        await sendMessage(
+          message.chat.id,
+          `🤖 Anti-Spam Bot работает!\n\n` +
+            `Подключи меня к своему Telegram Business аккаунту, ` +
+            `и я смогу автоматически обрабатывать твои личные чаты.\n\n` +
+            `Команды в личном чате:\n` +
+            `.mute — замьютить этот чат\n` +
+            `.unmute — снять мут`
+        );
       }
-      return;
+
+      return res.status(200).json({ ok: true });
     }
 
-    return; // Твои обычные сообщения не проверяем
-  }
+    // =========================================================
+    // 3. BUSINESS MESSAGE
+    // =========================================================
 
-  // --------------------------------------------------------
-  // Б) Проверка: замучен ли этот чат
-  // --------------------------------------------------------
-  if (global.mutedChats.has(chatId)) {
-    try {
-      await ctx.api.deleteMessage(chatId, msg.message_id, {
-        business_connection_id: connId,
-      });
-    } catch (e) {
-      console.error("Не удалось удалить сообщение собеседника:", e);
+    if (update.business_message) {
+      const message = update.business_message;
+
+      const connectionId = message.business_connection_id;
+      const chatId = message.chat.id;
+      const messageId = message.message_id;
+      const text = message.text?.trim();
+
+      if (!connectionId) {
+        return res.status(200).json({ ok: true });
+      }
+
+      const connection = connections.get(connectionId);
+
+      // -------------------------------------------------------
+      // Игнорируем сообщения, отправленные самим подключённым
+      // ботом от имени аккаунта.
+      // -------------------------------------------------------
+
+      if (message.sender_business_bot) {
+        return res.status(200).json({ ok: true });
+      }
+
+      // -------------------------------------------------------
+      // Если это сообщение отправил владелец аккаунта,
+      // обрабатываем команды.
+      // -------------------------------------------------------
+
+      const isOwner =
+        connection &&
+        message.from &&
+        message.from.id === connection.userId;
+
+      if (isOwner && text) {
+        // =========================
+        // .mute
+        // =========================
+
+        if (text === ".mute") {
+          mutedChats.add(String(chatId));
+
+          await sendMessage(
+            chatId,
+            "🔇 Пользователь замьючен.\n\n" +
+              "Все новые сообщения из этого чата будут автоматически удаляться.",
+            connectionId
+          );
+
+          // Удаляем саму команду .mute
+          await deleteBusinessMessage(
+            connectionId,
+            chatId,
+            messageId
+          );
+
+          return res.status(200).json({ ok: true });
+        }
+
+        // =========================
+        // .unmute
+        // =========================
+
+        if (text === ".unmute") {
+          mutedChats.delete(String(chatId));
+
+          await sendMessage(
+            chatId,
+            "🔊 Мут снят.\n\n" +
+              "Новые сообщения снова будут отображаться.",
+            connectionId
+          );
+
+          // Удаляем саму команду .unmute
+          await deleteBusinessMessage(
+            connectionId,
+            chatId,
+            messageId
+          );
+
+          return res.status(200).json({ ok: true });
+        }
+
+        // =========================
+        // .status
+        // =========================
+
+        if (text === ".status") {
+          const muted = mutedChats.has(String(chatId));
+
+          await sendMessage(
+            chatId,
+            muted
+              ? "🔇 Этот чат сейчас замьючен."
+              : "🔊 Этот чат сейчас не замьючен.",
+            connectionId
+          );
+
+          await deleteBusinessMessage(
+            connectionId,
+            chatId,
+            messageId
+          );
+
+          return res.status(200).json({ ok: true });
+        }
+      }
+
+      // -------------------------------------------------------
+      // АНТИСПАМ
+      //
+      // Если чат замьючен и сообщение пришло НЕ от владельца,
+      // удаляем его.
+      // -------------------------------------------------------
+
+      if (
+        mutedChats.has(String(chatId)) &&
+        !isOwner
+      ) {
+        console.log(
+          `Deleting message ${messageId} from muted chat ${chatId}`
+        );
+
+        await deleteBusinessMessage(
+          connectionId,
+          chatId,
+          messageId
+        );
+
+        return res.status(200).json({ ok: true });
+      }
+
+      return res.status(200).json({ ok: true });
     }
-    return;
+
+    // =========================================================
+    // 4. UNKNOWN UPDATE
+    // =========================================================
+
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    console.error("Webhook error:", error);
+
+    // Telegram должен получить 200, чтобы не создавать
+    // бесконечные повторные доставки из-за нашей ошибки.
+    return res.status(200).json({
+      ok: false,
+      error: "Internal error",
+    });
   }
-
-  // --------------------------------------------------------
-  // В) Авто-мут за спам (>5 сообщений за 20 секунд)
-  // --------------------------------------------------------
-  const now = Date.now();
-  let timestamps = global.messageHistory.get(chatId) || [];
-  timestamps = timestamps.filter((t) => now - t <= 20000);
-  timestamps.push(now);
-  global.messageHistory.set(chatId, timestamps);
-
-  if (timestamps.length > 5) {
-    global.mutedChats.add(chatId); // Мутим чат
-
-    try {
-      await ctx.api.deleteMessage(chatId, msg.message_id, {
-        business_connection_id: connId,
-      });
-    } catch (e) {
-      console.error("Ошибка при авто-удалении 6-го сообщения:", e);
-    }
-  }
-});
-
-module.exports = webhookCallback(bot, "http");
+}
