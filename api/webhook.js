@@ -7,26 +7,40 @@ if (!BOT_TOKEN) {
 
 const bot = new Bot(BOT_TOKEN);
 
-// Используем глобальный объект process для сохранения состояния между запросами в одном инстансе Vercel
+// Глобальные переменные в рамках горячего контейнера
 if (!global.mutedChats) global.mutedChats = new Set();
 if (!global.messageHistory) global.messageHistory = new Map();
 
+// --------------------------------------------------------
+// 1. ОБЫЧНЫЕ СООБЩЕНИЯ В ЛС БОТА (Команда /start)
+// --------------------------------------------------------
+bot.command("start", async (ctx) => {
+  await ctx.reply(
+    "🛡 **Guaard Bot запущен!**\n\n" +
+      "Я работаю в режиме Telegram Business.\n\n" +
+      "📌 **Как использовать в чатах:**\n" +
+      "• Напиши `.mute` в любом чате — входящие сообщения собеседника будут моментально удаляться.\n" +
+      "• Напиши `.unmute` — чтобы снять мут.\n" +
+      "• Если собеседник пришлёт больше 5 сообщений за 20 секунд — он автоматически уйдёт в мут."
+  );
+});
+
+// --------------------------------------------------------
+// 2. TELEGRAM BUSINESS MESSAGES (Работа в личных чатах)
+// --------------------------------------------------------
 bot.on("business_message", async (ctx) => {
   const msg = ctx.update.business_message;
   const connId = msg.business_connection_id;
-  const chatId = msg.chat.id; // ID текущего чата/собеседника
+  const chatId = msg.chat.id;
   const senderId = msg.from.id;
   const text = (msg.text || "").trim();
 
-  // --------------------------------------------------------
-  // 1. КОМАНДЫ ВЛАДЕЛЬЦА (когда пишешь ТЫ)
-  // --------------------------------------------------------
+  // А) Ты пишешь команды управления
   if (senderId === ctx.me.id) {
     if (text === ".mute") {
-      // Мутим этот конкретный чат
       global.mutedChats.add(chatId);
 
-      // Удаляем твою команду .mute из чата
+      // Удаляем само сообщение .mute
       try {
         await ctx.api.deleteBusinessMessage(connId, chatId, msg.message_id);
       } catch (e) {
@@ -49,11 +63,7 @@ bot.on("business_message", async (ctx) => {
     return; // Твои обычные сообщения не проверяем
   }
 
-  // --------------------------------------------------------
-  // 2. ПРОВЕРКА МУТА (Сообщения СОБЕСЕДНИКА)
-  // --------------------------------------------------------
-
-  // Если чат замучен — мгновенно удаляем входящее сообщение
+  // Б) Проверка: замучен ли этот чат
   if (global.mutedChats.has(chatId)) {
     try {
       await ctx.api.deleteBusinessMessage(connId, chatId, msg.message_id);
@@ -63,7 +73,7 @@ bot.on("business_message", async (ctx) => {
     return;
   }
 
-  // 3. АВТО-МУТ ЗА СПАМ (>5 сообщений за 20 секунд)
+  // В) Авто-мут за спам (>5 сообщений за 20 секунд)
   const now = Date.now();
   let timestamps = global.messageHistory.get(chatId) || [];
   timestamps = timestamps.filter((t) => now - t <= 20000);
@@ -71,7 +81,7 @@ bot.on("business_message", async (ctx) => {
   global.messageHistory.set(chatId, timestamps);
 
   if (timestamps.length > 5) {
-    global.mutedChats.add(chatId); // Авто-мут чата
+    global.mutedChats.add(chatId); // Автоматически мутим чат
 
     try {
       await ctx.api.deleteBusinessMessage(connId, chatId, msg.message_id);
