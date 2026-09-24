@@ -1,13 +1,13 @@
 {
-  "name": "telegram-antispam-business-bot",
+  "name": "telegram-business-antispam",
   "version": "1.0.0",
   "private": true,
-  "description": "Telegram Business anti-spam bot",
-  "main": "api/webhook.js",
+  "type": "module",
   "scripts": {
-    "start": "vercel dev"
+    "start": "node api/webhook.js"
   },
-  "engines": {
-    "node": "20.x"
+  "dependencies": {
+    "@upstash/redis": "^1.35.3",
+    "dotenv": "^16.4.7"
   }
 }
