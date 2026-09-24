@@ -1,13 +1,8 @@
 {
-  "name": "telegram-business-antispam",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "start": "node api/webhook.js"
-  },
-  "dependencies": {
-    "@upstash/redis": "^1.35.3",
-    "dotenv": "^16.4.7"
+  "version": 2,
+  "functions": {
+    "api/webhook.js": {
+      "runtime": "nodejs22.x"
+    }
   }
 }
