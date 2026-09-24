@@ -1,279 +1,315 @@
-const BOT_TOKEN = process.env.BOT_TOKEN;
+import "dotenv/config";
+import { Redis } from "@upstash/redis";
 
-if (!BOT_TOKEN) {
-  throw new Error("BOT_TOKEN is not configured");
+const TOKEN = process.env.BOT_TOKEN;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+
+if (!TOKEN) {
+  throw new Error("BOT_TOKEN не найден");
 }
 
-const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+if (!WEBHOOK_SECRET) {
+  throw new Error("WEBHOOK_SECRET не найден");
+}
 
-// MVP storage.
-// Важно: Vercel serverless не гарантирует постоянную память.
-// Для первого теста этого достаточно.
-const mutedChats = globalThis.mutedChats || new Set();
-globalThis.mutedChats = mutedChats;
+// ========================================
+// REDIS
+// ========================================
 
-const connections = globalThis.connections || new Map();
-globalThis.connections = connections;
+const redis = Redis.fromEnv();
 
-async function telegram(method, body) {
-  const response = await fetch(`${API}/${method}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+const MUTE_KEY_PREFIX = "muted:";
 
-  const data = await response.json();
+// ========================================
+// TELEGRAM API
+// ========================================
 
-  if (!data.ok) {
-    console.error(`Telegram API error (${method}):`, data);
+async function telegram(method, body = {}) {
+  const response = await fetch(
+    `https://api.telegram.org/bot${TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    }
+  );
+
+  const result = await response.json();
+
+  if (!result.ok) {
+    throw new Error(
+      `${method}: ${result.description || "Telegram API error"}`
+    );
   }
 
-  return data;
+  return result.result;
 }
 
-async function sendMessage(chatId, text, businessConnectionId = null) {
-  const body = {
-    chat_id: chatId,
+// ========================================
+// BUSINESS MESSAGE
+// ========================================
+
+async function sendBusinessMessage(message, text, extra = {}) {
+  return await telegram("sendMessage", {
+    business_connection_id: message.business_connection_id,
+    chat_id: message.chat.id,
     text,
-  };
-
-  if (businessConnectionId) {
-    body.business_connection_id = businessConnectionId;
-  }
-
-  return telegram("sendMessage", body);
-}
-
-async function deleteBusinessMessage(
-  businessConnectionId,
-  chatId,
-  messageId
-) {
-  return telegram("deleteBusinessMessages", {
-    business_connection_id: businessConnectionId,
-    chat_id: chatId,
-    message_ids: [messageId],
+    parse_mode: "HTML",
+    ...extra
   });
 }
+
+// ========================================
+// DELETE MESSAGE
+// ========================================
+
+async function deleteBusinessMessage(message) {
+  try {
+    await telegram("deleteBusinessMessages", {
+      business_connection_id: message.business_connection_id,
+      message_ids: [message.message_id]
+    });
+
+    console.log(
+      `🗑 Deleted ${message.message_id} | Chat ${message.chat.id}`
+    );
+
+    return true;
+  } catch (error) {
+    console.error(
+      `❌ Delete failed ${message.message_id}:`,
+      error.message
+    );
+
+    return false;
+  }
+}
+
+// ========================================
+// MUTE STATE
+// ========================================
+
+function muteKey(chatId) {
+  return `${MUTE_KEY_PREFIX}${chatId}`;
+}
+
+async function isMuted(chatId) {
+  return await redis.exists(muteKey(chatId));
+}
+
+async function setMuted(chatId) {
+  await redis.set(muteKey(chatId), "1");
+}
+
+async function setUnmuted(chatId) {
+  await redis.del(muteKey(chatId));
+}
+
+// ========================================
+// MUTE
+// ========================================
+
+async function muteChat(message) {
+  const chatId = message.chat.id;
+
+  await setMuted(chatId);
+
+  console.log("");
+  console.log("🔇 MUTE");
+  console.log(`Chat ID: ${chatId}`);
+  console.log(
+    `Username: @${message.chat.username || "нет"}`
+  );
+
+  await sendBusinessMessage(
+    message,
+    `<b>🔇 Пользователь был замучен</b>\n\n` +
+    `Теперь его сообщения будут автоматически удаляться.`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "🔊 Размутиться",
+              style: "success",
+              callback_data: "mute_joke"
+            }
+          ]
+        ]
+      }
+    }
+  );
+}
+
+// ========================================
+// UNMUTE
+// ========================================
+
+async function unmuteChat(message) {
+  const chatId = message.chat.id;
+
+  await setUnmuted(chatId);
+
+  console.log("");
+  console.log("🔊 UNMUTE");
+  console.log(`Chat ID: ${chatId}`);
+  console.log(
+    `Username: @${message.chat.username || "нет"}`
+  );
+
+  await sendBusinessMessage(
+    message,
+    `<b>🔊 Пользователь размучен</b>\n\n` +
+    `Теперь его сообщения снова будут отображаться.`
+  );
+}
+
+// ========================================
+// CALLBACK BUTTON
+// ========================================
+
+async function handleCallbackQuery(callbackQuery) {
+  if (callbackQuery.data !== "mute_joke") {
+    return;
+  }
+
+  console.log("😈 Нажата кнопка «Размутиться»");
+
+  try {
+    await telegram("answerCallbackQuery", {
+      callback_query_id: callbackQuery.id,
+      text:
+        "Ну всё бро, ты замучен 😎\n" +
+        "С ним самим общайся терь ))))",
+      show_alert: true
+    });
+  } catch (error) {
+    console.error(
+      "❌ Callback error:",
+      error.message
+    );
+  }
+}
+
+// ========================================
+// BUSINESS MESSAGE
+// ========================================
+
+async function handleBusinessMessage(message) {
+  const chatId = message.chat.id;
+  const username = message.from?.username;
+  const text = message.text?.trim();
+
+  console.log("");
+  console.log("========== MESSAGE ==========");
+  console.log(`Chat ID: ${chatId}`);
+  console.log(`Username: @${username || "нет"}`);
+  console.log(`Message ID: ${message.message_id}`);
+  console.log(`Text: ${text || "[без текста]"}`);
+  console.log("=============================");
+
+  // .mute
+  if (text?.toLowerCase() === ".mute") {
+    await muteChat(message);
+    return;
+  }
+
+  // .unmute
+  if (text?.toLowerCase() === ".unmute") {
+    await unmuteChat(message);
+    return;
+  }
+
+  // MUTE CHECK
+  if (await isMuted(chatId)) {
+    console.log("🚫 USER MUTED");
+    console.log(
+      `⚡ Удаляем ${message.message_id}`
+    );
+
+    // Не блокируем другие сообщения
+    await deleteBusinessMessage(message);
+
+    return;
+  }
+
+  console.log("➡️ Message allowed");
+}
+
+// ========================================
+// UPDATE
+// ========================================
+
+async function handleUpdate(update) {
+  try {
+    if (update.business_message) {
+      await handleBusinessMessage(
+        update.business_message
+      );
+    }
+
+    if (update.callback_query) {
+      await handleCallbackQuery(
+        update.callback_query
+      );
+    }
+  } catch (error) {
+    console.error(
+      "❌ Update error:",
+      error.message
+    );
+  }
+}
+
+// ========================================
+// VERCEL WEBHOOK
+// ========================================
 
 export default async function handler(req, res) {
+  // Только POST
   if (req.method !== "POST") {
     return res.status(200).json({
       ok: true,
-      message: "Anti-Spam Business Bot is running.",
+      message: "Telegram Business Anti-Spam"
     });
   }
 
-  try {
-    const update = req.body;
+  // ======================================
+  // WEBHOOK SECURITY
+  // ======================================
 
-    console.log("Telegram update:", JSON.stringify(update));
+  const incomingSecret =
+    req.headers["x-telegram-bot-api-secret-token"];
 
-    // =========================================================
-    // 1. BUSINESS CONNECTION
-    // =========================================================
+  if (incomingSecret !== WEBHOOK_SECRET) {
+    console.log("❌ Invalid webhook secret");
 
-    if (update.business_connection) {
-      const connection = update.business_connection;
-
-      if (connection.is_enabled) {
-        connections.set(connection.id, {
-          userId: connection.user.id,
-          rights: connection.rights || {},
-        });
-
-        console.log(
-          `Business connection enabled: ${connection.id}`
-        );
-      } else {
-        connections.delete(connection.id);
-
-        console.log(
-          `Business connection disabled: ${connection.id}`
-        );
-      }
-
-      return res.status(200).json({ ok: true });
-    }
-
-    // =========================================================
-    // 2. NORMAL /START
-    // =========================================================
-
-    if (update.message) {
-      const message = update.message;
-
-      if (
-        message.text &&
-        message.text.trim().toLowerCase().startsWith("/start")
-      ) {
-        await sendMessage(
-          message.chat.id,
-          `🤖 Anti-Spam Bot работает!\n\n` +
-            `Подключи меня к своему Telegram Business аккаунту, ` +
-            `и я смогу автоматически обрабатывать твои личные чаты.\n\n` +
-            `Команды в личном чате:\n` +
-            `.mute — замьютить этот чат\n` +
-            `.unmute — снять мут`
-        );
-      }
-
-      return res.status(200).json({ ok: true });
-    }
-
-    // =========================================================
-    // 3. BUSINESS MESSAGE
-    // =========================================================
-
-    if (update.business_message) {
-      const message = update.business_message;
-
-      const connectionId = message.business_connection_id;
-      const chatId = message.chat.id;
-      const messageId = message.message_id;
-      const text = message.text?.trim();
-
-      if (!connectionId) {
-        return res.status(200).json({ ok: true });
-      }
-
-      const connection = connections.get(connectionId);
-
-      // -------------------------------------------------------
-      // Игнорируем сообщения, отправленные самим подключённым
-      // ботом от имени аккаунта.
-      // -------------------------------------------------------
-
-      if (message.sender_business_bot) {
-        return res.status(200).json({ ok: true });
-      }
-
-      // -------------------------------------------------------
-      // Если это сообщение отправил владелец аккаунта,
-      // обрабатываем команды.
-      // -------------------------------------------------------
-
-      const isOwner =
-        connection &&
-        message.from &&
-        message.from.id === connection.userId;
-
-      if (isOwner && text) {
-        // =========================
-        // .mute
-        // =========================
-
-        if (text === ".mute") {
-          mutedChats.add(String(chatId));
-
-          await sendMessage(
-            chatId,
-            "🔇 Пользователь замьючен.\n\n" +
-              "Все новые сообщения из этого чата будут автоматически удаляться.",
-            connectionId
-          );
-
-          // Удаляем саму команду .mute
-          await deleteBusinessMessage(
-            connectionId,
-            chatId,
-            messageId
-          );
-
-          return res.status(200).json({ ok: true });
-        }
-
-        // =========================
-        // .unmute
-        // =========================
-
-        if (text === ".unmute") {
-          mutedChats.delete(String(chatId));
-
-          await sendMessage(
-            chatId,
-            "🔊 Мут снят.\n\n" +
-              "Новые сообщения снова будут отображаться.",
-            connectionId
-          );
-
-          // Удаляем саму команду .unmute
-          await deleteBusinessMessage(
-            connectionId,
-            chatId,
-            messageId
-          );
-
-          return res.status(200).json({ ok: true });
-        }
-
-        // =========================
-        // .status
-        // =========================
-
-        if (text === ".status") {
-          const muted = mutedChats.has(String(chatId));
-
-          await sendMessage(
-            chatId,
-            muted
-              ? "🔇 Этот чат сейчас замьючен."
-              : "🔊 Этот чат сейчас не замьючен.",
-            connectionId
-          );
-
-          await deleteBusinessMessage(
-            connectionId,
-            chatId,
-            messageId
-          );
-
-          return res.status(200).json({ ok: true });
-        }
-      }
-
-      // -------------------------------------------------------
-      // АНТИСПАМ
-      //
-      // Если чат замьючен и сообщение пришло НЕ от владельца,
-      // удаляем его.
-      // -------------------------------------------------------
-
-      if (
-        mutedChats.has(String(chatId)) &&
-        !isOwner
-      ) {
-        console.log(
-          `Deleting message ${messageId} from muted chat ${chatId}`
-        );
-
-        await deleteBusinessMessage(
-          connectionId,
-          chatId,
-          messageId
-        );
-
-        return res.status(200).json({ ok: true });
-      }
-
-      return res.status(200).json({ ok: true });
-    }
-
-    // =========================================================
-    // 4. UNKNOWN UPDATE
-    // =========================================================
-
-    return res.status(200).json({ ok: true });
-  } catch (error) {
-    console.error("Webhook error:", error);
-
-    // Telegram должен получить 200, чтобы не создавать
-    // бесконечные повторные доставки из-за нашей ошибки.
-    return res.status(200).json({
-      ok: false,
-      error: "Internal error",
+    return res.status(403).json({
+      ok: false
     });
   }
+
+  // ======================================
+  // TELEGRAM UPDATE
+  // ======================================
+
+  const update = req.body;
+
+  console.log(
+    "📩 Telegram update:",
+    update.update_id
+  );
+
+  // ======================================
+  // НЕ ЖДЕМ ВСЮ ОБРАБОТКУ
+  // ======================================
+
+  await handleUpdate(update);
+
+  // Telegram получает 200
+  return res.status(200).json({
+    ok: true
+  });
 }
